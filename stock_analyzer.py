@@ -187,6 +187,126 @@ def _consecutive(series: pd.Series) -> int:
     return cnt * sign
 
 
+def _safe_corr(a, b):
+    if a.std() == 0 or b.std() == 0:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _hit_rate(x: np.ndarray, r: np.ndarray):
+    """
+    方向命中率：在該法人「有買或有賣」的那些天裡，
+    股價漲跌方向跟他一致的比例。跟成交量大小完全無關，
+    只問「這個法人一動作，股價通常跟不跟」。
+    回傳 (rate, n_valid)；資料不足回傳 (None, 0)。
+    """
+    x_sign = np.sign(x)
+    r_sign = np.sign(r)
+    mask = (x_sign != 0) & (r_sign != 0)
+    n = int(mask.sum())
+    if n == 0:
+        return None, 0
+    hits = int(((x_sign == r_sign) & mask).sum())
+    return hits / n, n
+
+
+def _compute_control(df: pd.DataFrame, foreign: pd.Series, trust: pd.Series,
+                      ret: pd.Series, win: int) -> dict:
+    """
+    對指定天數(win)的區間，計算法人控盤研判。
+    核心邏輯改為「方向命中率」而非「買賣張數」：誰進出時股價比較會跟，
+    誰就是控盤者——即使他買賣的量比較小。
+    另外特別抓出「雙方方向相反」的那些天，股價實際跟誰，作為最直接的證據。
+    """
+    MIN_N = 3          # 命中率至少要幾個有效樣本才採信
+    WIN_MARGIN = 0.15  # 命中率差距、或偏離50%多少才判定有主導方（不是純巧合）
+
+    n = min(win, len(df) - 1)  # -1 因為 period_return 需要 win 天前的收盤
+    if n < 5:
+        return {"available": False, "window": win}
+
+    f = foreign.tail(n).reset_index(drop=True).astype(float).values
+    t = trust.tail(n).reset_index(drop=True).astype(float).values
+    r = ret.tail(n).reset_index(drop=True).values
+
+    f_corr = _safe_corr(pd.Series(f), pd.Series(r))
+    t_corr = _safe_corr(pd.Series(t), pd.Series(r))
+
+    up, down = r > 0, r < 0
+    f_up, t_up = float(f[up].sum()), float(t[up].sum())
+    f_down, t_down = float(f[down].sum()), float(t[down].sum())
+    up_driver = "外資" if f_up >= t_up else "投信"
+    down_driver = "外資" if f_down <= t_down else "投信"
+
+    period_ret = float((df["close"].iloc[-1] / df["close"].iloc[-n] - 1) * 100)
+
+    # ---- 方向命中率（核心：跟買賣量無關）----
+    f_rate, f_n = _hit_rate(f, r)
+    t_rate, t_n = _hit_rate(t, r)
+    f_ok, t_ok = f_n >= MIN_N, t_n >= MIN_N
+
+    # ---- 雙方方向相反的那些天，股價實際跟誰（最直接的證據）----
+    f_sign, t_sign, r_sign = np.sign(f), np.sign(t), np.sign(r)
+    conflict = (f_sign != 0) & (t_sign != 0) & (f_sign != t_sign) & (r_sign != 0)
+    conflict_n = int(conflict.sum())
+    trust_win_conflict = int(((r_sign == t_sign) & conflict).sum())
+    foreign_win_conflict = int(((r_sign == f_sign) & conflict).sum())
+    conflict_trust_rate = round(trust_win_conflict / conflict_n, 2) if conflict_n > 0 else None
+
+    method = "insufficient"
+    if f_ok and t_ok:
+        balance = round(t_rate - f_rate, 2)
+        method = "both"
+    elif t_ok and not f_ok:
+        balance = round((t_rate - 0.5) * 2, 2) if t_rate >= 0.5 else 0.0
+        method = "trust_only"
+    elif f_ok and not t_ok:
+        balance = round((0.5 - f_rate) * 2, 2) if f_rate >= 0.5 else 0.0
+        method = "foreign_only"
+    else:
+        balance = 0.0
+
+    controller = "中性" if abs(balance) < WIN_MARGIN else ("外資" if balance < 0 else "投信")
+
+    # ---- 白話研判：優先用「方向衝突日」講清楚（最貼近使用者想問的事）----
+    conflict_note = ""
+    if conflict_n >= 2 and conflict_trust_rate is not None:
+        winner = "投信" if conflict_trust_rate > 0.5 else ("外資" if conflict_trust_rate < 0.5 else None)
+        if winner:
+            pct = round((conflict_trust_rate if winner == "投信" else 1 - conflict_trust_rate) * 100)
+            conflict_note = (f"其中有 {conflict_n} 天外資與投信方向相反，"
+                              f"股價有 {pct}% 的天數跟隨「{winner}」（即使另一方同時反向操作）。")
+
+    if method == "both":
+        base = f"近 {n} 日外資方向命中率 {round(f_rate*100)}%（{f_n}天有動作），投信方向命中率 {round(t_rate*100)}%（{t_n}天有動作）。"
+    elif method == "trust_only":
+        base = f"近 {n} 日投信雖僅 {t_n} 天有動作，但方向命中率達 {round(t_rate*100)}%；外資動作天數不足以判斷。"
+    elif method == "foreign_only":
+        base = f"近 {n} 日外資方向命中率 {round(f_rate*100)}%（{f_n}天有動作）；投信動作天數不足以判斷。"
+    else:
+        base = f"近 {n} 日兩方買賣動作都太少，無法判斷方向命中率。"
+
+    if controller == "中性":
+        verdict = base + "　雙方對股價方向的影響力接近，較偏籌碼以外因素或散戶。" + conflict_note
+    else:
+        verdict = base + f"　研判由「{controller}」主導股價方向（不代表買賣量較大）。" + conflict_note
+
+    return {
+        "available": True, "window": n,
+        "controller": controller, "balance": balance,
+        "up_driver": up_driver, "down_driver": down_driver,
+        "foreign_corr": round(f_corr, 2), "trust_corr": round(t_corr, 2),
+        "foreign_hit_rate": round(f_rate, 2) if f_rate is not None else None,
+        "foreign_hit_n": f_n,
+        "trust_hit_rate": round(t_rate, 2) if t_rate is not None else None,
+        "trust_hit_n": t_n,
+        "conflict_days": conflict_n,
+        "conflict_trust_rate": conflict_trust_rate,
+        "method": method,
+        "period_return": round(period_ret, 1), "verdict": verdict,
+    }
+
+
 def chips_block(df: pd.DataFrame) -> dict:
     # 股 -> 張
     foreign = (df["foreign_net"] / LOT).round().astype(int)
@@ -198,71 +318,19 @@ def chips_block(df: pd.DataFrame) -> dict:
             "today": int(s.iloc[-1]),
             "d5": int(s.tail(5).sum()),
             "d20": int(s.tail(20).sum()),
+            "d60": int(s.tail(60).sum()),
             "consecutive": _consecutive(s),
         }
 
-    # ---- 控盤研判 (取近 20 個交易日) ----
-    win = 20
-    f = foreign.tail(win).reset_index(drop=True).astype(float)
-    t = trust.tail(win).reset_index(drop=True).astype(float)
-    r = ret.tail(win).reset_index(drop=True)
-
-    def safe_corr(a, b):
-        if a.std() == 0 or b.std() == 0:
-            return 0.0
-        return float(np.corrcoef(a, b)[0, 1])
-
-    f_corr = safe_corr(f, r)   # 外資買賣 與 漲跌 的相關
-    t_corr = safe_corr(t, r)   # 投信買賣 與 漲跌 的相關
-
-    up = r > 0
-    down = r < 0
-    f_up, t_up = float(f[up].sum()), float(t[up].sum())       # 上漲日法人合計
-    f_down, t_down = float(f[down].sum()), float(t[down].sum())  # 下跌日法人合計
-
-    period_ret = float((df["close"].iloc[-1] / df["close"].iloc[-win] - 1) * 100) \
-        if len(df) > win else 0.0
-
-    up_driver = "外資" if f_up >= t_up else "投信"
-    down_driver = "外資" if f_down <= t_down else "投信"  # 賣超越多(越負)者主導下跌
-
-    # 控盤研判：以「近20日累積淨額且與股價趨勢同向」為主，相關性為信心加權
-    f_net20, t_net20 = float(f.sum()), float(t.sum())
-    trend_sign = 1.0 if period_ret >= 0 else -1.0
-    f_pos = max(f_net20 * trend_sign, 0.0) * (0.5 + abs(f_corr))
-    t_pos = max(t_net20 * trend_sign, 0.0) * (0.5 + abs(t_corr))
-    total_force = f_pos + t_pos
-    if total_force <= 1e-9:
-        controller, balance = "中性", 0.0
-    else:
-        balance = round((t_pos - f_pos) / total_force, 2)
-        controller = "中性" if abs(balance) < 0.15 else ("外資" if f_pos > t_pos else "投信")
-
-    # 產生一句白話研判
-    if controller == "中性":
-        verdict = "近 20 日法人influence不明顯，股價較偏籌碼以外因素或散戶。"
-    else:
-        main = controller
-        if period_ret >= 0:
-            verdict = (f"近 20 日股價漲約 {period_ret:.1f}%，"
-                       f"主要由{up_driver}在上漲日加碼推升；研判由「{main}」主導控盤。")
-        else:
-            verdict = (f"近 20 日股價跌約 {period_ret:.1f}%，"
-                       f"主要由{down_driver}在下跌日調節；研判由「{main}」主導控盤。")
+    # 短、中兩種區間各自研判，不同時間尺度可能給出不同結論（例如短線中性、波段仍是某方主導）
+    windows = {"20": _compute_control(df, foreign, trust, ret, 20),
+               "60": _compute_control(df, foreign, trust, ret, 60)}
 
     return {
         "foreign": summary(foreign),
         "trust": summary(trust),
-        "control": {
-            "controller": controller,
-            "balance": balance,
-            "up_driver": up_driver,
-            "down_driver": down_driver,
-            "foreign_corr": round(f_corr, 2),
-            "trust_corr": round(t_corr, 2),
-            "period_return": round(period_ret, 1),
-            "verdict": verdict,
-        },
+        "windows": windows,
+        "control": windows["20"],   # 向下相容：預設仍以近20日為主要欄位
     }
 
 
