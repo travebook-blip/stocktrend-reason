@@ -1,0 +1,39 @@
+name: 每日更新籌碼控盤資料
+
+# 觸發時間：台灣時間每個交易日(週一~週五) 18:00 自動執行，
+# 也可在 Actions 分頁手動按 Run workflow 立即執行。
+on:
+  schedule:
+    - cron: '0 10 * * 1-5'   # UTC 10:00 = 台灣 18:00
+  workflow_dispatch:
+
+permissions:
+  contents: write            # 允許把更新後的 data.json / data.js 推回 repo
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取得程式碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 抓取並分析（FinMind 真實資料）
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}   # 在 repo Secrets 設定
+        run: python stock_analyzer.py --live --watchlist watchlist.txt
+
+      - name: 提交更新後的資料
+        run: |
+          git config user.name  "stock-bot"
+          git config user.email "stock-bot@users.noreply.github.com"
+          git add data.json data.js
+          git commit -m "資料自動更新 $(date -u +'%Y-%m-%d %H:%M') UTC" || echo "本次無變更，略過提交"
+          git push
