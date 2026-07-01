@@ -1,9 +1,9 @@
 name: 每日更新籌碼控盤資料
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "0 10 * * 1-5"
-  workflow_dispatch:
 
 permissions:
   contents: write
