@@ -167,7 +167,7 @@ textarea:focus{outline:none;border-color:var(--foreign);box-shadow:0 0 0 3px rgb
 
   <div class="panel">
     <div class="ph">股票清單</div>
-    <textarea id="codes" placeholder="輸入股票代號，每行一檔或用逗號分隔　例如：2330,2454,2603&#10;按「貼上範例」可載入示範清單"></textarea>
+    <textarea id="codes" placeholder="手動輸入股票代號（每行一檔，或用逗號／空白分隔），例如：2330 2454 2603&#10;也可按「匯入 CSV」讀檔；清單會自動記憶，下次打開還在"></textarea>
     <div class="opts">
       <div class="seg" id="srcSeg">
         <button data-src="demo" class="on">範例 Demo</button>
@@ -176,6 +176,8 @@ textarea:focus{outline:none;border-color:var(--foreign);box-shadow:0 0 0 3px rgb
       <label class="btn ghost" for="csv" style="display:inline-block">匯入 CSV
         <input id="csv" type="file" accept=".csv,.txt" style="display:none"></label>
       <button class="btn ghost" id="sampleBtn">貼上範例</button>
+      <button class="btn ghost" id="copyBtn">複製清單</button>
+      <button class="btn ghost" id="clearBtn">清除</button>
       <div class="proxy" id="proxyBox" style="display:none">CORS 代理：
         <input id="proxy" placeholder="https://corsproxy.io/?url=" /></div>
       <button class="btn primary" id="runBtn">開始分析</button>
@@ -646,14 +648,44 @@ $('srcSeg').querySelectorAll('button').forEach(b=>b.onclick=()=>{
   $('proxyBox').style.display=MODE==='live'?'flex':'none';
 });
 
-$('sampleBtn').onclick=()=>{ $('codes').value=Object.keys(DEMO_DATA).join(', '); };
+$('sampleBtn').onclick=()=>{ $('codes').value=Object.keys(DEMO_DATA).join(', '); saveList(); };
+
+// 清除：清空輸入與畫面，回到可重新分析的狀態
+$('clearBtn').onclick=()=>{
+  $('codes').value='';
+  RESULTS=[]; ACTIVE_FILTER='all';
+  $('grid').innerHTML='';
+  $('summary').style.display='none'; $('filters').style.display='none';
+  setStatus('已清除，請輸入新的股票清單後按「開始分析」。');
+  saveList();
+  $('codes').focus();
+};
+
+// 複製清單：輸出成 watchlist.txt 格式，方便貼回 GitHub 的 watchlist.txt
+$('copyBtn').onclick=async()=>{
+  const codes=parseCodes();
+  if(!codes.length){ setStatus('<span class="err">清單是空的，沒有可複製的內容</span>'); return; }
+  const text=codes.join('\n');
+  try{ await navigator.clipboard.writeText(text);
+    setStatus(`<span class="ok">已複製 ${codes.length} 檔</span>　（可直接貼到 GitHub 的 watchlist.txt）`);
+  }catch(e){
+    // 後備：無剪貼簿權限時，把內容放進輸入框讓使用者自行複製
+    $('codes').value=text; setStatus('已整理成每行一檔的格式，請手動全選複製。');
+  }
+};
+
+// 清單自動記憶（存在瀏覽器，讀不到時自動略過，不影響其他功能）
+function saveList(){ try{ localStorage.setItem('watchlist_codes', $('codes').value); }catch(e){} }
+function loadList(){ try{ return localStorage.getItem('watchlist_codes'); }catch(e){ return null; } }
+$('codes').addEventListener('input', saveList);
 
 $('csv').onchange=e=>{
   const f=e.target.files[0]; if(!f)return;
   const rd=new FileReader();
   rd.onload=()=>{ const codes=(rd.result.match(/\d{4,6}/g)||[]).filter((v,i,a)=>a.indexOf(v)===i);
-    $('codes').value=codes.join(', '); setStatus(`已從 CSV 讀入 ${codes.length} 檔`); };
+    $('codes').value=codes.join(', '); saveList(); setStatus(`已從 CSV 讀入 ${codes.length} 檔`); };
   rd.readAsText(f,'utf-8');
+  e.target.value='';   // 允許重複選同一檔
 };
 
 $('runBtn').onclick=async()=>{
@@ -679,10 +711,12 @@ function initFromPipeline(){
   } else initDemo();
 }
 function initDemo(){
-  $('codes').value=Object.keys(DEMO_DATA).join(', ');
+  if(!$('codes').value.trim()) $('codes').value=Object.keys(DEMO_DATA).join(', ');
   runDemo([]);
 }
 (function(){
+  // 載入時先還原「記憶的清單」到輸入框（若有）
+  const saved=loadList(); if(saved && saved.trim()) $('codes').value=saved;
   const s=document.createElement('script');
   s.src='data.js'; s.onload=initFromPipeline; s.onerror=initDemo;
   document.head.appendChild(s);
