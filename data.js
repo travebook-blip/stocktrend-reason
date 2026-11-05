@@ -1,1 +1,1 @@
-window.__STOCK_DATA__ = {"generated_at": "2026-11-04 17:53", "mode": "live", "stocks": []};
+window.__STOCK_DATA__ = {"generated_at": "2026-11-05 17:56", "mode": "live", "stocks": []};
